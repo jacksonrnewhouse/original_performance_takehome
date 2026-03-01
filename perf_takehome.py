@@ -113,17 +113,6 @@ class KernelBuilder:
         for v in init_vars:
             self.alloc_scratch(v, 1)
 
-        # Load init vars from memory
-        for i in range(0, len(init_vars), 2):
-            loads = [("const", tmp1, i)]
-            if i + 1 < len(init_vars):
-                loads.append(("const", tmp2, i + 1))
-            self.emit({"load": loads})
-            loads2 = [("load", self.scratch[init_vars[i]], tmp1)]
-            if i + 1 < len(init_vars):
-                loads2.append(("load", self.scratch[init_vars[i + 1]], tmp2))
-            self.emit({"load": loads2})
-
         # === Determine fused hash stages ===
         fused_stages = set()
         fused_multipliers = {}
@@ -135,7 +124,7 @@ class KernelBuilder:
 
         # === Scalar constants ===
         const_vals = set()
-        const_vals.update([0, 1, 2, 3])  # 3 needed for level 2 offset
+        const_vals.update([0, 1, 2, 3])
         for (op1, val1, op2, op3, val3) in HASH_STAGES:
             const_vals.add(val1)
             const_vals.add(val3)
@@ -144,12 +133,6 @@ class KernelBuilder:
 
         for val in sorted(const_vals):
             self.alloc_scratch_const(val)
-        unloaded = sorted(const_vals)
-        for i in range(0, len(unloaded), 2):
-            loads = [("const", self.const_map[unloaded[i]], unloaded[i])]
-            if i + 1 < len(unloaded):
-                loads.append(("const", self.const_map[unloaded[i + 1]], unloaded[i + 1]))
-            self.emit({"load": loads})
 
         zero_const = self.const_map[0]
         one_const = self.const_map[1]
@@ -163,7 +146,7 @@ class KernelBuilder:
             s_idx.append(self.alloc_scratch(f"s_idx_{g}", VLEN))
             s_val.append(self.alloc_scratch(f"s_val_{g}", VLEN))
 
-        # === Vector constants (removed unused: v_forest_p, v_n_nodes, v_zero, v_three) ===
+        # === Vector constants ===
         v_one = self.alloc_scratch("v_one", VLEN)
         v_two = self.alloc_scratch("v_two", VLEN)
 
@@ -179,25 +162,9 @@ class KernelBuilder:
             if mult not in v_fused_mult:
                 v_fused_mult[mult] = self.alloc_scratch(f"v_fm_{mult}", VLEN)
 
-        vbroadcasts = [
-            ("vbroadcast", v_one, one_const),
-            ("vbroadcast", v_two, two_const),
-        ]
-        for val, v_hc_addr in sorted(v_hash_consts.items()):
-            vbroadcasts.append(("vbroadcast", v_hc_addr, self.const_map[val]))
-        for mult, v_fm_addr in sorted(v_fused_mult.items()):
-            vbroadcasts.append(("vbroadcast", v_fm_addr, self.const_map[mult]))
-
-        for i in range(0, len(vbroadcasts), 6):
-            self.emit({"valu": vbroadcasts[i:i+6]})
-
         # === Preload forest values for small levels (0-2) ===
-        # Level 0: node 0 (1 value)
-        # Level 1: nodes 1,2 (2 values)
-        # Level 2: nodes 3,4,5,6 (4 values)
         level_node_scalars = {}
         level_node_vectors = {}
-
         nodes_to_load = []
         for level in range(3):
             start = 2**level - 1
@@ -206,55 +173,14 @@ class KernelBuilder:
                 node_idx = start + offset
                 s_addr = self.alloc_scratch(f"forest_node_{node_idx}")
                 level_node_scalars[(level, offset)] = s_addr
-                # Only allocate vectors for levels 1-2 (level 0 uses scalar XOR)
                 if level >= 1:
                     v_addr = self.alloc_scratch(f"v_forest_node_{node_idx}", VLEN)
                     level_node_vectors[(level, offset)] = v_addr
                 nodes_to_load.append((node_idx, level, offset))
 
-        # Ensure node index constants exist
         for node_idx, level, offset in nodes_to_load:
             if node_idx not in self.const_map:
                 self.alloc_scratch_const(node_idx)
-        extra_consts = sorted(set(n[0] for n in nodes_to_load) - set(self.const_map.keys()))
-        # Actually all should be in const_map now via alloc_scratch_const. Load any that weren't loaded.
-        # The alloc_scratch_const just allocates, doesn't emit const load.
-        # We need to emit const loads for node indices.
-        node_indices = sorted(set(n[0] for n in nodes_to_load))
-        for i in range(0, len(node_indices), 2):
-            loads = [("const", self.const_map[node_indices[i]], node_indices[i])]
-            if i + 1 < len(node_indices):
-                loads.append(("const", self.const_map[node_indices[i + 1]], node_indices[i + 1]))
-            self.emit({"load": loads})
-
-        # Compute forest memory addresses
-        for i in range(0, len(nodes_to_load), 12):
-            batch = nodes_to_load[i:i+12]
-            alu_ops = []
-            for node_idx, level, offset in batch:
-                s_addr = level_node_scalars[(level, offset)]
-                alu_ops.append(("+", s_addr, self.scratch["forest_values_p"], self.const_map[node_idx]))
-            self.emit({"alu": alu_ops})
-
-        # Load forest values from memory
-        for i in range(0, len(nodes_to_load), 2):
-            loads = []
-            for j in range(2):
-                if i + j < len(nodes_to_load):
-                    node_idx, level, offset = nodes_to_load[i + j]
-                    s_addr = level_node_scalars[(level, offset)]
-                    loads.append(("load", s_addr, s_addr))
-            self.emit({"load": loads})
-
-        # Broadcast forest values to vectors (skip level 0 - uses scalar XOR)
-        bcast_ops = []
-        for node_idx, level, offset in nodes_to_load:
-            if level >= 1:
-                s_addr = level_node_scalars[(level, offset)]
-                v_addr = level_node_vectors[(level, offset)]
-                bcast_ops.append(("vbroadcast", v_addr, s_addr))
-        for i in range(0, len(bcast_ops), 6):
-            self.emit({"valu": bcast_ops[i:i+6]})
 
         # === Memory address scalars for vload/vstore ===
         mem_idx_addr = []
@@ -266,25 +192,90 @@ class KernelBuilder:
             mem_idx_addr.append(self.alloc_scratch(f"mem_idx_addr_{g}"))
             mem_val_addr.append(self.alloc_scratch(f"mem_val_addr_{g}"))
 
-        offsets_to_load = sorted(set(g * VLEN for g in range(N_GROUPS)))
-        for i in range(0, len(offsets_to_load), 2):
-            loads = [("const", self.const_map[offsets_to_load[i]], offsets_to_load[i])]
-            if i + 1 < len(offsets_to_load):
-                loads.append(("const", self.const_map[offsets_to_load[i + 1]], offsets_to_load[i + 1]))
+        # === Emit packed setup instructions (VLIW: overlap load+valu+alu) ===
+        # Phase 1: Load init vars (must be sequential const+load pairs)
+        for i in range(0, len(init_vars), 2):
+            loads = [("const", tmp1, i)]
+            if i + 1 < len(init_vars):
+                loads.append(("const", tmp2, i + 1))
             self.emit({"load": loads})
+            loads2 = [("load", self.scratch[init_vars[i]], tmp1)]
+            if i + 1 < len(init_vars):
+                loads2.append(("load", self.scratch[init_vars[i + 1]], tmp2))
+            self.emit({"load": loads2})
 
-        for i in range(0, N_GROUPS, 12):
-            batch_end = min(i + 12, N_GROUPS)
-            alu_ops = []
-            for g in range(i, batch_end):
-                alu_ops.append(("+", mem_idx_addr[g], self.scratch["inp_indices_p"], self.const_map[g * VLEN]))
-            self.emit({"alu": alu_ops})
-        for i in range(0, N_GROUPS, 12):
-            batch_end = min(i + 12, N_GROUPS)
-            alu_ops = []
-            for g in range(i, batch_end):
-                alu_ops.append(("+", mem_val_addr[g], self.scratch["inp_values_p"], self.const_map[g * VLEN]))
-            self.emit({"alu": alu_ops})
+        # Phase 2: Load ALL scalar constants first (broadcasts depend on them)
+        all_const_vals = sorted(set(
+            list(const_vals)
+            + sorted(set(n[0] for n in nodes_to_load))
+            + sorted(set(g * VLEN for g in range(N_GROUPS)))
+        ))
+        const_load_ops = [("const", self.const_map[v], v) for v in all_const_vals]
+        for i in range(0, len(const_load_ops), 2):
+            self.emit({"load": const_load_ops[i:i+2]})
+
+        # Phase 3: Vector broadcasts + forest addr ALU (independent, overlap)
+        vbroadcasts = [
+            ("vbroadcast", v_one, one_const),
+            ("vbroadcast", v_two, two_const),
+        ]
+        for val, v_hc_addr in sorted(v_hash_consts.items()):
+            vbroadcasts.append(("vbroadcast", v_hc_addr, self.const_map[val]))
+        for mult, v_fm_addr in sorted(v_fused_mult.items()):
+            vbroadcasts.append(("vbroadcast", v_fm_addr, self.const_map[mult]))
+
+        forest_alu_ops = []
+        for node_idx, level, offset in nodes_to_load:
+            s_addr = level_node_scalars[(level, offset)]
+            forest_alu_ops.append(("+", s_addr, self.scratch["forest_values_p"], self.const_map[node_idx]))
+
+        # Emit broadcasts overlapped with forest ALU
+        vi = 0
+        alu_emitted = False
+        while vi < len(vbroadcasts):
+            instr = {"valu": vbroadcasts[vi:vi+6]}
+            vi += 6
+            if not alu_emitted:
+                instr["alu"] = forest_alu_ops
+                alu_emitted = True
+            self.emit(instr)
+        if not alu_emitted:
+            self.emit({"alu": forest_alu_ops})
+
+        # Phase 4: Forest value loads + forest broadcasts (pipelined)
+        # Forest loads must come AFTER forest ALU. Forest broadcasts must come AFTER forest loads.
+        forest_load_ops = []
+        for node_idx, level, offset in nodes_to_load:
+            s_addr = level_node_scalars[(level, offset)]
+            forest_load_ops.append(("load", s_addr, s_addr))
+        for i in range(0, len(forest_load_ops), 2):
+            self.emit({"load": forest_load_ops[i:i+2]})
+
+        forest_bcast_ops = []
+        for node_idx, level, offset in nodes_to_load:
+            if level >= 1:
+                s_addr = level_node_scalars[(level, offset)]
+                v_addr = level_node_vectors[(level, offset)]
+                forest_bcast_ops.append(("vbroadcast", v_addr, s_addr))
+
+        # Phase 5: Forest broadcasts + memory addr ALU (overlap)
+        all_mem_alu = []
+        for g in range(N_GROUPS):
+            all_mem_alu.append(("+", mem_idx_addr[g], self.scratch["inp_indices_p"], self.const_map[g * VLEN]))
+        for g in range(N_GROUPS):
+            all_mem_alu.append(("+", mem_val_addr[g], self.scratch["inp_values_p"], self.const_map[g * VLEN]))
+
+        fbi = 0
+        ai = 0
+        while fbi < len(forest_bcast_ops) or ai < len(all_mem_alu):
+            instr = {}
+            if fbi < len(forest_bcast_ops):
+                instr["valu"] = forest_bcast_ops[fbi:fbi+6]
+                fbi += 6
+            if ai < len(all_mem_alu):
+                instr["alu"] = all_mem_alu[ai:ai+12]
+                ai += 12
+            self.emit(instr)
 
         self.emit({"flow": [("pause",)]})
 
@@ -687,8 +678,28 @@ class KernelBuilder:
                 if fwd_rem[succ] == 0:
                     fwd_q.append(succ)
 
-        # Combined priority: longest_path + depth_from_source * gamma
-        priority = [-(longest_path[i] + depth_from_source[i] * DEPTH_GAMMA) for i in range(N_OPS)]
+        # Compute distance to nearest downstream LOAD op (load proximity)
+        LOAD_DIST_WEIGHT = 8000.0
+        LOAD_DIST_DECAY = 55
+        dist_to_load = [float('inf')] * N_OPS
+        load_q = deque()
+        for i in range(N_OPS):
+            if op_list[i]["eng"] == "load":
+                dist_to_load[i] = 0
+                load_q.append(i)
+        while load_q:
+            node = load_q.popleft()
+            d = dist_to_load[node]
+            for pred in op_list[node]["deps"]:
+                if d + 1 < dist_to_load[pred]:
+                    dist_to_load[pred] = d + 1
+                    load_q.append(pred)
+
+        # Combined priority: longest_path + depth_from_source + load proximity
+        base_priority = [-(longest_path[i] + depth_from_source[i] * DEPTH_GAMMA) for i in range(N_OPS)]
+        load_prox = [-max(0, LOAD_DIST_DECAY - dist_to_load[i]) / LOAD_DIST_DECAY * LOAD_DIST_WEIGHT
+                     if dist_to_load[i] < float('inf') else 0 for i in range(N_OPS)]
+        priority = [base_priority[i] + load_prox[i] for i in range(N_OPS)]
 
         # List scheduling with priority heaps
         import heapq
